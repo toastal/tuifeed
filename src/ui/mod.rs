@@ -35,7 +35,8 @@ use model::Model;
 use crate::config::Config;
 use lib::{FeedClient, FeedState, Kiosk};
 
-use std::time::Duration;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 use tuirealm::{
     application::PollStrategy,
     event::{Key, KeyEvent, KeyModifiers},
@@ -48,6 +49,7 @@ use tuirealm::{
 use self::lib::FlatFeedState;
 
 const FORCED_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
+const STANDY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ## Id
 ///
@@ -102,6 +104,8 @@ pub struct Ui {
     config: Config,
     model: Model,
     app: Application<Id, Msg, NoUserEvent>,
+    /// last user interaction; if gt than `STANDY_TIMEOUT` a sleep will be performed to save resources
+    last_user_input: Instant,
 }
 
 impl Ui {
@@ -116,6 +120,7 @@ impl Ui {
             client: FeedClient::default(),
             model,
             app,
+            last_user_input: Instant::now(),
         }
     }
 
@@ -128,8 +133,14 @@ impl Ui {
         self.fetch_all_sources();
         // Main loop
         while !self.model.quit() {
-            if let Err(err) = self.app.tick(&mut self.model, PollStrategy::UpTo(3)) {
-                self.mount_error_popup(format!("Application error: {}", err));
+            match self.app.tick(&mut self.model, PollStrategy::UpTo(3)) {
+                Ok(0) => {}
+                Ok(_) => {
+                    self.last_user_input = Instant::now();
+                }
+                Err(err) => {
+                    self.mount_error_popup(format!("Application error: {}", err));
+                }
             }
             // Poll fetched sources
             self.poll_fetched_sources();
@@ -139,6 +150,10 @@ impl Ui {
             self.check_force_redraw();
             // View
             self.model.view(&mut self.app);
+            // If in standby, wait for 500ms
+            if self.in_standby() {
+                sleep(Duration::from_millis(500));
+            }
         }
         self.model.finalize_terminal();
     }
@@ -161,6 +176,13 @@ impl Ui {
                 Task::ShowError(err) => self.mount_error_popup(err),
             }
         }
+    }
+
+    /// ### in_standby
+    ///
+    /// Check whether Ui is in standby mode
+    fn in_standby(&self) -> bool {
+        self.last_user_input.elapsed() >= STANDY_TIMEOUT
     }
 
     /// ### check_force_redraw
