@@ -26,23 +26,22 @@
  * SOFTWARE.
  */
 mod components;
+mod context;
 mod lib;
-mod model;
 
 use components::{ErrorPopup, GlobalListener};
-use model::Model;
+pub use context::Context;
 
 use crate::config::Config;
 use lib::{FeedClient, FeedState, Kiosk};
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tuirealm::{
     application::PollStrategy,
     event::{Key, KeyEvent, KeyModifiers},
     props::{PropPayload, PropValue},
-    terminal::TerminalBridge,
     Application, AttrValue, Attribute, EventListenerCfg, NoUserEvent, Sub, SubClause,
-    SubEventClause,
+    SubEventClause, Update,
 };
 
 use self::lib::FlatFeedState;
@@ -87,35 +86,37 @@ pub enum Msg {
     None,
 }
 
-/// ## Task
-///
-/// A task requested by the model in the Update routine, to be performed by the ui
-#[derive(Debug, Clone, PartialEq)]
-pub enum Task {
-    FetchSource(String),
-    FetchSources,
-    ShowError(String),
-}
-
 pub struct Ui {
+    context: Option<Context>,
     client: FeedClient,
-    config: Config,
-    model: Model,
     app: Application<Id, Msg, NoUserEvent>,
+    kiosk: Kiosk,
+    quit: bool,
+    last_redraw: Instant,
+    redraw: bool,
 }
 
 impl Ui {
     /// ### new
     ///
     /// Instantiates a new Ui
-    pub fn new(config: Config, tick: u64) -> Self {
-        let model = Model::new(&config, Self::init_terminal());
-        let app = Self::init_application(&model, tick);
+    pub fn new(context: Context, tick: u64) -> Self {
+        let mut kiosk = Kiosk::default();
+        for name in context.config().sources.keys() {
+            kiosk.insert_feed(name, FeedState::Loading);
+        }
         Self {
-            config,
+            context: Some(context),
             client: FeedClient::default(),
-            model,
-            app,
+            app: Application::init(
+                EventListenerCfg::default()
+                    .default_input_listener(Duration::from_millis(tick))
+                    .poll_timeout(Duration::from_millis(tick)),
+            ),
+            kiosk,
+            quit: false,
+            last_redraw: Instant::now(),
+            redraw: false,
         }
     }
 
@@ -123,24 +124,40 @@ impl Ui {
     ///
     /// Main loop for Ui thread
     pub fn run(&mut self) {
-        self.model.init_terminal();
+        let _ = self.context_mut().terminal().enable_raw_mode();
+        let _ = self.context_mut().terminal().enter_alternate_screen();
+        let _ = self.context_mut().terminal().clear_screen();
+        self.init_app();
         // Fetch sources once
         self.fetch_all_sources();
         // Main loop
-        while !self.model.quit() {
-            if let Err(err) = self.app.tick(&mut self.model, PollStrategy::UpTo(3)) {
-                self.mount_error_popup(format!("Application error: {}", err));
+        while !self.quit {
+            match self.app.tick(PollStrategy::UpTo(3)) {
+                Ok(messages) => {
+                    if !messages.is_empty() {
+                        self.force_redraw();
+                    }
+                    for msg in messages.into_iter() {
+                        let mut msg = Some(msg);
+                        while msg.is_some() {
+                            msg = self.update(msg);
+                        }
+                    }
+                }
+                Err(err) => {
+                    self.mount_error_popup(format!("Application error: {}", err));
+                }
             }
             // Poll fetched sources
             self.poll_fetched_sources();
-            // Run tasks
-            self.run_tasks();
             // Check whether to force redraw
             self.check_force_redraw();
             // View
-            self.model.view(&mut self.app);
+            self.view();
         }
-        self.model.finalize_terminal();
+        let _ = self.context_mut().terminal().disable_raw_mode();
+        let _ = self.context_mut().terminal().leave_alternate_screen();
+        let _ = self.context_mut().terminal().clear_screen();
     }
 
     // -- private
@@ -152,7 +169,7 @@ impl Ui {
         for task in self.model.get_tasks().into_iter() {
             match task {
                 Task::FetchSource(name) => {
-                    let uri = self.config.sources.get(&name).cloned();
+                    let uri = self.context().config().sources.get(&name).cloned();
                     if let Some(uri) = uri {
                         self.fetch_source(name.as_str(), uri.as_str())
                     }
@@ -168,9 +185,17 @@ impl Ui {
     /// Check whether should force redraw
     fn check_force_redraw(&mut self) {
         // If source are loading and at least 100ms has elapsed since last redraw...
-        if self.client.running() && self.model.since_last_redraw() >= FORCED_REDRAW_INTERVAL {
-            self.model.force_redraw();
+        if self.client.running() && self.last_redraw.elapsed() >= FORCED_REDRAW_INTERVAL {
+            self.force_redraw();
         }
+    }
+
+    fn context(&self) -> &Context {
+        self.context.as_ref().unwrap()
+    }
+
+    fn context_mut(&mut self) -> &mut Context {
+        self.context.as_mut().unwrap()
     }
 
     // -- source fetch
@@ -182,7 +207,8 @@ impl Ui {
     fn fetch_all_sources(&mut self) {
         // Fetch sources
         let sources: Vec<(String, String)> = self
-            .config
+            .context()
+            .config()
             .sources
             .iter()
             .map(|(name, uri)| (name.clone(), uri.clone()))
@@ -198,10 +224,10 @@ impl Ui {
     fn fetch_source(&mut self, name: &str, uri: &str) {
         self.client.fetch(name, uri);
         // Mark source as Loading
-        self.model.update_source(name, FeedState::Loading);
+        self.kiosk.insert_feed(name, FeedState::Loading);
         self.update_feed_list(name, FlatFeedState::Loading);
         // Force redraw
-        self.model.force_redraw();
+        self.force_redraw();
     }
 
     /// ### poll_fetched_sources
@@ -220,14 +246,14 @@ impl Ui {
             };
             // Update source
             let flat_state = FlatFeedState::from(&state);
-            self.model.update_source(name.as_str(), state);
+            self.kiosk.insert_feed(name.as_str(), state);
             // Update feed list and initialize article
             self.update_feed_list(name.as_str(), flat_state);
             if self.is_article_list_empty() {
                 self.init_article();
             }
             // Force redraw
-            self.model.force_redraw();
+            self.force_redraw();
         }
     }
 
@@ -259,16 +285,13 @@ impl Ui {
     /// Initialize article list entries and article.
     /// This function should be called only if article list is empty
     fn init_article(&mut self) {
-        if let Some(source) = self.model.sorted_sources().get(0) {
-            if let Some(feed) = self.model.kiosk().get_feed(source.as_str()) {
+        if let Some(source) = self.sorted_sources().get(0) {
+            if let Some(feed) = self.kiosk.get_feed(source.as_str()) {
                 assert!(self
                     .app
                     .remount(
                         Id::ArticleList,
-                        Box::new(Model::get_article_list(
-                            feed,
-                            self.model.max_article_name_len()
-                        )),
+                        Box::new(View::get_article_list(feed, self.max_article_name_len())),
                         vec![]
                     )
                     .is_ok());
@@ -327,19 +350,11 @@ impl Ui {
         assert!(self.app.active(&Id::ErrorPopup).is_ok());
     }
 
-    /// ### init_terminal
-    ///
-    /// Initialize terminal.
-    /// Panics if it fails to connect the terminal bridge
-    fn init_terminal() -> TerminalBridge {
-        TerminalBridge::new().expect("Could not create terminal bridge")
-    }
-
     /// ### init_application
     ///
     /// Initialize application.
     /// Panics if it fails
-    fn init_application(model: &Model, tick: u64) -> Application<Id, Msg, NoUserEvent> {
+    fn init_application(kiosk: &Kiosk, tick: u64) -> Application<Id, Msg, NoUserEvent> {
         let mut app = Application::init(
             EventListenerCfg::default()
                 .default_input_listener(Duration::from_millis(tick))
@@ -369,7 +384,7 @@ impl Ui {
     /// ### subs
     ///
     /// global listener subscriptions
-    fn subs() -> Vec<Sub<NoUserEvent>> {
+    fn subs() -> Vec<Sub<Id, NoUserEvent>> {
         vec![
             Sub::new(
                 SubEventClause::Keyboard(KeyEvent {
@@ -393,5 +408,42 @@ impl Ui {
                 SubClause::Always,
             ),
         ]
+    }
+
+    // -- ex model funcs
+
+    /// ### max_article_name_len
+    ///
+    /// Get max article name length for the article list
+    fn max_article_name_len(&self) -> usize {
+        (self.terminal_width() / 2) - 9 // 50 % - margin - 1
+    }
+
+    /// ### force_redraw
+    ///
+    /// Force the value of redraw to `true`
+    pub fn force_redraw(&mut self) {
+        self.redraw = true;
+    }
+
+    /// ### sorted_sources
+    ///
+    /// Get sorted sources from kiosk
+    fn sorted_sources(&self) -> Vec<&String> {
+        let mut sources = self.kiosk.sources();
+        sources.sort();
+        sources
+    }
+
+    /// ### terminal_width
+    ///
+    /// Get terminal width. If it fails to collect width, returns 65535
+    fn terminal_width(&self) -> usize {
+        self.context_mut()
+            .terminal()
+            .raw()
+            .size()
+            .map(|x| x.width as usize)
+            .unwrap_or(u16::MAX as usize)
     }
 }

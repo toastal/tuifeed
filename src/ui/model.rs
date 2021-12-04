@@ -49,108 +49,10 @@ pub struct Model {
     quit: bool,
     last_redraw: Instant,
     redraw: bool,
-    tasks: Vec<Task>,
     terminal: TerminalBridge,
 }
 
 impl Model {
-    /// ### new
-    ///
-    /// Instantiates a new `Model`
-    pub fn new(config: &Config, terminal: TerminalBridge) -> Self {
-        // Initialize kiosk
-        let mut kiosk = Kiosk::default();
-        for name in config.sources.keys() {
-            kiosk.insert_feed(name, FeedState::Loading);
-        }
-        Self {
-            kiosk,
-            last_redraw: Instant::now(),
-            quit: false,
-            redraw: true,
-            tasks: Vec::new(),
-            terminal,
-        }
-    }
-
-    /// ### init_terminal
-    ///
-    /// Initialize terminal
-    pub fn init_terminal(&mut self) {
-        let _ = self.terminal.enable_raw_mode();
-        let _ = self.terminal.enter_alternate_screen();
-        let _ = self.terminal.clear_screen();
-    }
-
-    /// ### finalize_terminal
-    ///
-    /// Finalize terminal
-    pub fn finalize_terminal(&mut self) {
-        let _ = self.terminal.disable_raw_mode();
-        let _ = self.terminal.leave_alternate_screen();
-        let _ = self.terminal.clear_screen();
-    }
-
-    /// ### max_article_name_len
-    ///
-    /// Get max article name length for the article list
-    pub fn max_article_name_len(&self) -> usize {
-        (self.terminal_width() / 2) - 9 // 50 % - margin - 1
-    }
-
-    /// ### force_redraw
-    ///
-    /// Force the value of redraw to `true`
-    pub fn force_redraw(&mut self) {
-        self.redraw = true;
-    }
-
-    /// ### quit
-    ///
-    /// Returns whether should quit
-    pub fn quit(&self) -> bool {
-        self.quit
-    }
-
-    /// ### kiosk
-    ///
-    /// Returns reference to kiosk
-    pub fn kiosk(&self) -> &Kiosk {
-        &self.kiosk
-    }
-
-    /// ### update_source
-    ///
-    /// Update source in kiosk
-    pub fn update_source(&mut self, name: &str, state: FeedState) {
-        self.kiosk.insert_feed(name.to_string(), state);
-    }
-
-    /// ### sorted_sources
-    ///
-    /// Get sorted sources from kiosk
-    pub fn sorted_sources(&self) -> Vec<&String> {
-        let mut sources = self.kiosk().sources();
-        sources.sort();
-        sources
-    }
-
-    /// ### get_tasks
-    ///
-    /// Get tasks requested by the model
-    pub fn get_tasks(&mut self) -> Vec<Task> {
-        let tasks = self.tasks.clone();
-        self.tasks.clear();
-        tasks
-    }
-
-    /// ### since_last_redraw
-    ///
-    /// Returns elapsed time since last redraw
-    pub fn since_last_redraw(&self) -> Duration {
-        self.last_redraw.elapsed()
-    }
-
     /// ### view
     ///
     /// View function to render the view
@@ -296,13 +198,6 @@ impl Model {
             .size()
             .map(|x| x.width as usize)
             .unwrap_or(u16::MAX as usize)
-    }
-
-    /// ### task
-    ///
-    /// Schedule a new task for the Ui
-    fn task(&mut self, task: Task) {
-        self.tasks.push(task);
     }
 
     /// ### update_article
